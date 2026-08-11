@@ -40,7 +40,7 @@ The request and token values returned in xAI response headers are transient thro
 | --- | ---: | --- |
 | `grokCopilot.reasoningEffort` | `high` | Default effort for reasoning-capable models; the model-picker selection overrides it |
 | `grokCopilot.maxOutputTokens` | `16384` | Maximum output tokens requested from Grok |
-| `grokCopilot.requestTimeoutSeconds` | `600` | Request timeout in seconds |
+| `grokCopilot.requestTimeoutSeconds` | `600` | Max seconds to wait for headers or the next streamed chunk |
 | `grokCopilot.debugLogging` | `false` | Log request, usage, stream, and rate-limit metadata to the Grok output channel |
 
 Prompts and OAuth tokens are not written to the output channel.
@@ -50,5 +50,6 @@ Prompts and OAuth tokens are not written to the output channel.
 - **No Grok models in the picker:** enable **xAI Grok** under **Manage Models**, then run **Grok: Refresh Models**.
 - **Browser sign-in cannot complete:** cancel it and use the device-code command.
 - **Authentication or API errors:** open **Grok: Manage xAI Connection**, test the connection, and inspect the Grok output channel.
+- **Chat stuck on Working… / Reasoning…:** lower `grokCopilot.requestTimeoutSeconds` temporarily and check the Grok output channel; stalled streams should now time out instead of hanging until a window reload.
 - **Context window stays at 0%:** start a new chat after updating the extension. Completed Grok responses report exact input/output usage to VS Code; old sessions do not gain usage retroactively.
 - **Need a diagnostic snapshot:** run **Grok: Show Diagnostics** and include the generated report when filing an issue. Remove any information you do not want to share.

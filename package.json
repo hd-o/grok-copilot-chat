@@ -99,7 +99,7 @@
           "type": "number",
           "default": 600,
           "minimum": 10,
-          "description": "Maximum duration of an xAI request in seconds."
+          "description": "Maximum seconds to wait for xAI response headers or the next streamed chunk. Active streams refresh this timer on each chunk."
         },
         "grokCopilot.debugLogging": {
           "type": "boolean",

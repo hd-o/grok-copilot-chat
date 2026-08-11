@@ -17,7 +17,12 @@ import {
   type DiscoveredModel,
 } from "./model-limits";
 import { XaiOAuth } from "./oauth";
-import { ChatCompletionStreamParser, type ChatStreamEvent } from "./sse";
+import type { ChatStreamEvent } from "./sse";
+import {
+  consumeChatCompletionStream,
+  isAbortError,
+  ReasoningSequence,
+} from "./stream";
 import {
   mergeUsageSnapshot,
   parseApiRateLimitHeaders,
@@ -173,41 +178,79 @@ export class GrokProvider implements vscode.LanguageModelChatProvider<GrokModel>
         this.configuration.get("maxOutputTokens", DEFAULT_MAX_OUTPUT_TOKENS),
       ).maxOutputTokens,
     );
-    let accessToken = await this.oauth.getAccessToken();
-    let response = await this.sendRequest(accessToken, requestBody, token);
-    if (response.status === 401) {
-      accessToken = await this.oauth.getAccessToken(true);
-      response = await this.sendRequest(accessToken, requestBody, token);
-    }
-    this.captureApiLimits(response.headers, `chat:${model.rawModelId}`);
-    if (!response.ok) throw await apiError(`xAI request failed for ${model.rawModelId}`, response);
-    if (!response.body) throw new Error("xAI returned an empty response stream");
 
-    if (this.debugLogging) {
-      this.output.appendLine(`[request] model=${model.rawModelId} effort=${reasoningEffort ?? "model-default"} initiator=${options.requestInitiator ?? "unknown"}`);
-    }
+    // Keep abort/timeout active for headers AND body. Clearing them after fetch()
+    // resolves previously allowed stalled streams to hang forever on reader.read().
+    // The timer is refreshed on each streamed chunk so active long responses can
+    // continue, while a silent stall still aborts after requestTimeoutSeconds.
+    const controller = new AbortController();
+    const timeoutSeconds = Math.max(
+      10,
+      this.configuration.get("requestTimeoutSeconds", 600),
+    );
+    let timedOut = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const armTimeout = (): void => {
+      if (timeout) clearTimeout(timeout);
+      timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutSeconds * 1000);
+    };
+    armTimeout();
+    const listener = token.onCancellationRequested(() => controller.abort());
 
-    const parser = new ChatCompletionStreamParser();
-    let finalUsage: Record<string, unknown> | undefined;
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    while (true) {
-      if (token.isCancellationRequested) {
-        await reader.cancel();
-        return;
+    try {
+      let accessToken = await this.oauth.getAccessToken();
+      if (token.isCancellationRequested) return;
+      if (controller.signal.aborted) throw requestTimeoutError(timeoutSeconds);
+      let response = await this.sendRequest(accessToken, requestBody, controller.signal);
+      if (response.status === 401) {
+        accessToken = await this.oauth.getAccessToken(true);
+        if (token.isCancellationRequested) return;
+        if (controller.signal.aborted) throw requestTimeoutError(timeoutSeconds);
+        response = await this.sendRequest(accessToken, requestBody, controller.signal);
       }
-      const result = await reader.read();
-      if (result.done) break;
-      for (const event of parser.push(decoder.decode(result.value, { stream: true }))) {
-        reportEvent(event, progress);
-        if (event.usage) finalUsage = event.usage;
+      this.captureApiLimits(response.headers, `chat:${model.rawModelId}`);
+      if (!response.ok) throw await apiError(`xAI request failed for ${model.rawModelId}`, response);
+      if (!response.body) throw new Error("xAI returned an empty response stream");
+
+      if (this.debugLogging) {
+        this.output.appendLine(`[request] model=${model.rawModelId} effort=${reasoningEffort ?? "model-default"} initiator=${options.requestInitiator ?? "unknown"}`);
       }
+
+      armTimeout();
+      const reasoning = new ReasoningSequence();
+      let finalUsage: Record<string, unknown> | undefined;
+      let aborted = false;
+      await consumeChatCompletionStream(
+        response.body,
+        (event) => {
+          reportEvent(event, progress, reasoning);
+          if (event.usage) finalUsage = event.usage;
+        },
+        {
+          signal: controller.signal,
+          onChunk: armTimeout,
+          onAbort: () => {
+            aborted = true;
+          },
+        },
+      );
+      endReasoningIfNeeded(progress, reasoning);
+      if (token.isCancellationRequested) return;
+      if (aborted || timedOut || controller.signal.aborted) {
+        throw requestTimeoutError(timeoutSeconds);
+      }
+      if (finalUsage) this.captureRequestUsage(finalUsage, model.rawModelId);
+    } catch (error) {
+      if (token.isCancellationRequested) return;
+      if (timedOut || isAbortError(error)) throw requestTimeoutError(timeoutSeconds);
+      throw error;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      listener.dispose();
     }
-    for (const event of parser.finish()) {
-      reportEvent(event, progress);
-      if (event.usage) finalUsage = event.usage;
-    }
-    if (finalUsage) this.captureRequestUsage(finalUsage, model.rawModelId);
   }
 
   async provideTokenCount(
@@ -257,31 +300,19 @@ export class GrokProvider implements vscode.LanguageModelChatProvider<GrokModel>
   private async sendRequest(
     accessToken: string,
     requestBody: Record<string, unknown>,
-    cancellation: vscode.CancellationToken,
+    signal: AbortSignal,
   ): Promise<Response> {
-    const controller = new AbortController();
-    const timeoutSeconds = Math.max(
-      10,
-      this.configuration.get("requestTimeoutSeconds", 600),
-    );
-    const timeout = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
-    const listener = cancellation.onCancellationRequested(() => controller.abort());
-    try {
-      return await fetch(`${API_BASE}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-          "User-Agent": this.userAgent,
-        },
-        body: JSON.stringify(requestBody),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timeout);
-      listener.dispose();
-    }
+    return await fetch(`${API_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        "User-Agent": this.userAgent,
+      },
+      body: JSON.stringify(requestBody),
+      signal,
+    });
   }
 
   private captureApiLimits(headers: Headers, source: string): void {
@@ -420,13 +451,16 @@ function toolMode(mode: vscode.LanguageModelChatToolMode | undefined): "auto" | 
 function reportEvent(
   event: ChatStreamEvent,
   progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
+  reasoning: ReasoningSequence,
 ): void {
-  if (event.text) progress.report(new vscode.LanguageModelTextPart(event.text));
   if (event.reasoning) {
-    const ThinkingPart = (vscode as unknown as { LanguageModelThinkingPart?: typeof vscode.LanguageModelThinkingPart })
-      .LanguageModelThinkingPart;
-    if (ThinkingPart) progress.report(new ThinkingPart(event.reasoning));
+    reasoning.noteReasoning();
+    reportThinking(progress, event.reasoning);
   }
+  if (event.text || event.toolCalls?.length || event.done) {
+    endReasoningIfNeeded(progress, reasoning);
+  }
+  if (event.text) progress.report(new vscode.LanguageModelTextPart(event.text));
   for (const tool of event.toolCalls ?? []) {
     progress.report(new vscode.LanguageModelToolCallPart(
       tool.id || `grok-tool-${Date.now()}`,
@@ -440,6 +474,28 @@ function reportEvent(
   }
 }
 
+function endReasoningIfNeeded(
+  progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
+  reasoning: ReasoningSequence,
+): void {
+  if (!reasoning.end()) return;
+  // Copilot's LM wrapper ends thinking with an empty part + this metadata flag.
+  // Without it, a reasoning-only or stalled-before-text turn can leave the UI on "Reasoning...".
+  reportThinking(progress, "", undefined, { vscode_reasoning_done: true });
+}
+
+function reportThinking(
+  progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
+  value: string,
+  id?: string,
+  metadata?: Record<string, unknown>,
+): void {
+  const ThinkingPart = (vscode as unknown as { LanguageModelThinkingPart?: typeof vscode.LanguageModelThinkingPart })
+    .LanguageModelThinkingPart;
+  if (!ThinkingPart) return;
+  progress.report(new ThinkingPart(value, id, metadata));
+}
+
 function parseArguments(value: string): object {
   try {
     const parsed = JSON.parse(value || "{}");
@@ -451,6 +507,10 @@ function parseArguments(value: string): object {
 
 function formatModelName(id: string): string {
   return id.split("-").map((part) => part === "grok" ? "Grok" : part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
+}
+
+function requestTimeoutError(timeoutSeconds: number): Error {
+  return new Error(`xAI request timed out after ${timeoutSeconds}s while waiting for the model stream`);
 }
 
 async function apiError(prefix: string, response: Response): Promise<Error> {
