@@ -99,7 +99,7 @@
           "type": "number",
           "default": 600,
           "minimum": 10,
-          "description": "Maximum seconds to wait for xAI response headers or the next streamed chunk. Active streams refresh this timer on each chunk."
+          "description": "Maximum duration of an xAI chat request in seconds, including the streamed response body."
         },
         "grokCopilot.debugLogging": {
           "type": "boolean",

@@ -18,11 +18,7 @@ import {
 } from "./model-limits";
 import { XaiOAuth } from "./oauth";
 import type { ChatStreamEvent } from "./sse";
-import {
-  consumeChatCompletionStream,
-  isAbortError,
-  ReasoningSequence,
-} from "./stream";
+import { consumeChatCompletionStream, isAbortError } from "./stream";
 import {
   mergeUsageSnapshot,
   parseApiRateLimitHeaders,
@@ -181,23 +177,16 @@ export class GrokProvider implements vscode.LanguageModelChatProvider<GrokModel>
 
     // Keep abort/timeout active for headers AND body. Clearing them after fetch()
     // resolves previously allowed stalled streams to hang forever on reader.read().
-    // The timer is refreshed on each streamed chunk so active long responses can
-    // continue, while a silent stall still aborts after requestTimeoutSeconds.
     const controller = new AbortController();
     const timeoutSeconds = Math.max(
       10,
       this.configuration.get("requestTimeoutSeconds", 600),
     );
     let timedOut = false;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const armTimeout = (): void => {
-      if (timeout) clearTimeout(timeout);
-      timeout = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, timeoutSeconds * 1000);
-    };
-    armTimeout();
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutSeconds * 1000);
     const listener = token.onCancellationRequested(() => controller.abort());
 
     try {
@@ -219,36 +208,24 @@ export class GrokProvider implements vscode.LanguageModelChatProvider<GrokModel>
         this.output.appendLine(`[request] model=${model.rawModelId} effort=${reasoningEffort ?? "model-default"} initiator=${options.requestInitiator ?? "unknown"}`);
       }
 
-      armTimeout();
-      const reasoning = new ReasoningSequence();
       let finalUsage: Record<string, unknown> | undefined;
-      let aborted = false;
-      await consumeChatCompletionStream(
+      const streamResult = await consumeChatCompletionStream(
         response.body,
         (event) => {
-          reportEvent(event, progress, reasoning);
+          reportEvent(event, progress);
           if (event.usage) finalUsage = event.usage;
         },
-        {
-          signal: controller.signal,
-          onChunk: armTimeout,
-          onAbort: () => {
-            aborted = true;
-          },
-        },
+        controller.signal,
       );
-      endReasoningIfNeeded(progress, reasoning);
       if (token.isCancellationRequested) return;
-      if (aborted || timedOut || controller.signal.aborted) {
-        throw requestTimeoutError(timeoutSeconds);
-      }
+      if (streamResult === "aborted" || timedOut) throw requestTimeoutError(timeoutSeconds);
       if (finalUsage) this.captureRequestUsage(finalUsage, model.rawModelId);
     } catch (error) {
       if (token.isCancellationRequested) return;
       if (timedOut || isAbortError(error)) throw requestTimeoutError(timeoutSeconds);
       throw error;
     } finally {
-      if (timeout) clearTimeout(timeout);
+      clearTimeout(timeout);
       listener.dispose();
     }
   }
@@ -451,16 +428,13 @@ function toolMode(mode: vscode.LanguageModelChatToolMode | undefined): "auto" | 
 function reportEvent(
   event: ChatStreamEvent,
   progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
-  reasoning: ReasoningSequence,
 ): void {
-  if (event.reasoning) {
-    reasoning.noteReasoning();
-    reportThinking(progress, event.reasoning);
-  }
-  if (event.text || event.toolCalls?.length || event.done) {
-    endReasoningIfNeeded(progress, reasoning);
-  }
   if (event.text) progress.report(new vscode.LanguageModelTextPart(event.text));
+  if (event.reasoning) {
+    const ThinkingPart = (vscode as unknown as { LanguageModelThinkingPart?: typeof vscode.LanguageModelThinkingPart })
+      .LanguageModelThinkingPart;
+    if (ThinkingPart) progress.report(new ThinkingPart(event.reasoning));
+  }
   for (const tool of event.toolCalls ?? []) {
     progress.report(new vscode.LanguageModelToolCallPart(
       tool.id || `grok-tool-${Date.now()}`,
@@ -472,28 +446,6 @@ function reportEvent(
     const data = new TextEncoder().encode(JSON.stringify(toProviderUsagePayload(event.usage)));
     progress.report(new vscode.LanguageModelDataPart(data, "usage"));
   }
-}
-
-function endReasoningIfNeeded(
-  progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
-  reasoning: ReasoningSequence,
-): void {
-  if (!reasoning.end()) return;
-  // Copilot's LM wrapper ends thinking with an empty part + this metadata flag.
-  // Without it, a reasoning-only or stalled-before-text turn can leave the UI on "Reasoning...".
-  reportThinking(progress, "", undefined, { vscode_reasoning_done: true });
-}
-
-function reportThinking(
-  progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
-  value: string,
-  id?: string,
-  metadata?: Record<string, unknown>,
-): void {
-  const ThinkingPart = (vscode as unknown as { LanguageModelThinkingPart?: typeof vscode.LanguageModelThinkingPart })
-    .LanguageModelThinkingPart;
-  if (!ThinkingPart) return;
-  progress.report(new ThinkingPart(value, id, metadata));
 }
 
 function parseArguments(value: string): object {

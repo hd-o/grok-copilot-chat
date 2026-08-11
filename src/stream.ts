@@ -1,13 +1,5 @@
 import { ChatCompletionStreamParser, type ChatStreamEvent } from "./sse";
 
-export interface StreamAbortOptions {
-  signal?: AbortSignal;
-  /** Called when the stream ends because of abort/cancellation rather than natural completion. */
-  onAbort?: () => void;
-  /** Called when any body bytes arrive, including incomplete SSE fragments. */
-  onChunk?: () => void;
-}
-
 /**
  * Read an SSE chat-completion body while honoring AbortSignal for the full
  * stream lifetime (not only until response headers arrive).
@@ -15,9 +7,8 @@ export interface StreamAbortOptions {
 export async function consumeChatCompletionStream(
   body: ReadableStream<Uint8Array>,
   onEvent: (event: ChatStreamEvent) => void,
-  options: StreamAbortOptions = {},
-): Promise<void> {
-  const { signal, onAbort, onChunk } = options;
+  signal?: AbortSignal,
+): Promise<"completed" | "aborted"> {
   const parser = new ChatCompletionStreamParser();
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -39,8 +30,7 @@ export async function consumeChatCompletionStream(
   if (signal) {
     if (signal.aborted) {
       await cancelReader();
-      onAbort?.();
-      return;
+      return "aborted";
     }
     signal.addEventListener("abort", onSignalAbort);
   }
@@ -62,7 +52,6 @@ export async function consumeChatCompletionStream(
         throw error;
       }
       if (result.done) break;
-      onChunk?.();
       for (const event of parser.push(decoder.decode(result.value, { stream: true }))) {
         onEvent(event);
       }
@@ -71,9 +60,9 @@ export async function consumeChatCompletionStream(
       for (const event of parser.finish()) {
         onEvent(event);
       }
-    } else {
-      onAbort?.();
+      return "completed";
     }
+    return "aborted";
   } finally {
     signal?.removeEventListener("abort", onSignalAbort);
   }
@@ -84,24 +73,4 @@ export function isAbortError(error: unknown): boolean {
   const name = "name" in error ? String((error as { name?: unknown }).name) : "";
   const code = "code" in error ? String((error as { code?: unknown }).code) : "";
   return name === "AbortError" || code === "ABORT_ERR";
-}
-
-/** Tracks whether a thinking/reasoning sequence is open so it can be closed cleanly. */
-export class ReasoningSequence {
-  private active = false;
-
-  get isActive(): boolean {
-    return this.active;
-  }
-
-  noteReasoning(): void {
-    this.active = true;
-  }
-
-  /** Returns true once when an open reasoning sequence should be marked done. */
-  end(): boolean {
-    if (!this.active) return false;
-    this.active = false;
-    return true;
-  }
 }
