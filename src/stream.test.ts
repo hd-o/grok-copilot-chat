@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ChatStreamEvent } from "./sse";
 import { consumeChatCompletionStream, isAbortError, ReasoningSequence } from "./stream";
 
 function sseStream(chunks: string[], stallAfter?: number): ReadableStream<Uint8Array> {
@@ -26,7 +27,7 @@ function sseStream(chunks: string[], stallAfter?: number): ReadableStream<Uint8A
 }
 
 test("consumeChatCompletionStream parses the full SSE body", async () => {
-  const events: Array<{ text?: string; reasoning?: string }> = [];
+  const events: ChatStreamEvent[] = [];
   await consumeChatCompletionStream(
     sseStream([
       'data: {"choices":[{"delta":{"reasoning_content":"plan"}}]}\n\n',
