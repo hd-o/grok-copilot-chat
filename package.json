@@ -99,7 +99,7 @@
           "type": "number",
           "default": 600,
           "minimum": 10,
-          "description": "Maximum duration of an xAI chat request in seconds, including the streamed response body."
+          "description": "Maximum duration of an xAI request in seconds."
         },
         "grokCopilot.debugLogging": {
           "type": "boolean",
